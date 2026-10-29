@@ -78,3 +78,7 @@ tools/equity-research/eqr.py        # fundamentals, risk and DCF calculations
 tools/equity-research/requirements.txt
 install.sh
 ```
+
+## License
+
+[MIT](LICENSE)
