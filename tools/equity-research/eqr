@@ -1,0 +1,2 @@
+#!/bin/sh
+PYTHONWARNINGS=ignore exec "$HOME/.claude/tools/equity-research/.venv/bin/python" "$HOME/.claude/tools/equity-research/eqr.py" "$@"
