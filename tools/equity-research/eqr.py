@@ -121,7 +121,7 @@ def fundamentals(ticker):
         "operating_income": _series(inc, "Operating Income", "EBIT"),
         "net_income": _series(inc, "Net Income", "Net Income Common Stockholders"),
         "ebitda": _series(inc, "EBITDA", "Normalized EBITDA"),
-        "interest_expense": _series(inc, "Interest Expense"),
+        "interest_expense": _series(inc, "Interest Expense", "Interest Expense Non Operating"),
         "tax_provision": _series(inc, "Tax Provision"),
         "pretax_income": _series(inc, "Pretax Income"),
         "operating_cash_flow": cfo,
@@ -157,8 +157,23 @@ def fundamentals(ticker):
         "capex": ttm_capex,
         "free_cash_flow": ttm_cfo + ttm_capex if ttm_cfo is not None and ttm_capex is not None else None,
         "cash_latest_quarter": _latest(qbs, "Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments"),
+        "cash_and_short_term_investments_latest_quarter": _latest(qbs, "Cash Cash Equivalents And Short Term Investments"),
+        "long_term_investments_latest_quarter": _latest(qbs, "Investments And Advances"),
         "total_debt_latest_quarter": _latest(qbs, "Total Debt"),
     }
+    if ttm["interest_expense"] is None:
+        ttm["interest_expense"] = _ttm(qinc, "Interest Expense Non Operating")
+
+    # Analyst consensus revenue growth: current fiscal year (0y) and next (+1y)
+    consensus = {}
+    try:
+        est = t.revenue_estimate
+        for period in ("0y", "+1y"):
+            if est is not None and period in est.index:
+                consensus[period] = {"growth": _num(est.loc[period, "growth"]),
+                                     "analysts": _num(est.loc[period, "numberOfAnalysts"])}
+    except Exception:
+        pass
     quarterly = {
         "revenue": {str(d.date()): v for d, v in q_rev},
         "operating_income": {str(d.date()): v for d, v in _quarters(qinc, "Operating Income", "EBIT")},
@@ -175,6 +190,7 @@ def fundamentals(ticker):
     return {"ticker": ticker.upper(), "snapshot": snapshot, "history": history,
             "ttm": ttm, "quarterly": quarterly,
             "derived": {"revenue_cagr": cagr, "revenue_yoy_latest_quarter": yoy,
+                        "consensus_revenue_growth": consensus,
                         "latest_annual_period": latest_annual}}
 
 
@@ -236,6 +252,9 @@ def risk(ticker, years=5, benchmark="SPY", rf=None):
 
 # ---------- DCF ----------
 
+DEBT_SPREAD = 0.01  # spread over risk-free when a company reports no interest expense
+
+
 def _dcf_value(fcf0, g_start, g_term, wacc, years, net_debt, shares):
     """Two-stage FCFF DCF. Growth fades linearly from g_start to g_term over `years`."""
     if wacc <= g_term:
@@ -259,7 +278,7 @@ def _dcf_value(fcf0, g_start, g_term, wacc, years, net_debt, shares):
 
 
 def dcf(ticker, growth=None, terminal=0.025, wacc=None, years=5, fcf=None,
-        erp=0.05, rf=None, beta=None):
+        erp=0.05, rf=None, beta=None, kd=None, exclude_investments=False):
     f = fundamentals(ticker)
     snap, hist = f["snapshot"], f["history"]
     rf = risk_free_rate() if rf is None else rf
@@ -286,32 +305,62 @@ def dcf(ticker, growth=None, terminal=0.025, wacc=None, years=5, fcf=None,
     if fcf <= 0:
         notes.append("Base FCF is negative or zero; a DCF on this base is not meaningful without --fcf.")
 
-    # Growth: latest-quarter YoY revenue growth, else Yahoo's figure, else annual CAGR; clipped
+    # Growth: average of analyst consensus revenue growth (this FY and next) and the
+    # historical annual revenue CAGR, so one unusual quarter can't swing the default.
+    # Falls back to latest-quarter YoY growth only when none of those exist. Clipped.
+    growth_inputs = {}
     if growth is None:
         d = f["derived"]
-        for src, cand in (("latest-quarter YoY revenue growth", d["revenue_yoy_latest_quarter"]),
-                          ("Yahoo revenue growth", snap.get("revenueGrowth")),
-                          ("annual revenue CAGR", d["revenue_cagr"]), ("fallback", 0.05)):
-            if cand is not None:
-                break
+        cons = d["consensus_revenue_growth"]
+        for label, val in (("consensus current FY", cons.get("0y", {}).get("growth")),
+                           ("consensus next FY", cons.get("+1y", {}).get("growth")),
+                           ("historical annual CAGR", d["revenue_cagr"])):
+            if val is not None:
+                growth_inputs[label] = val
+        if growth_inputs:
+            cand = sum(growth_inputs.values()) / len(growth_inputs)
+            src = "average of " + ", ".join(f"{k} {v:.1%}" for k, v in growth_inputs.items())
+        elif d["revenue_yoy_latest_quarter"] is not None:
+            cand = d["revenue_yoy_latest_quarter"]
+            growth_inputs["latest-quarter YoY"] = cand
+            src = "latest-quarter YoY revenue growth only; noisy"
+        else:
+            cand, src = 0.05, "no data; flat 5% fallback"
         growth = max(min(cand, 0.25), -0.05)
-        notes.append(f"Stage-1 growth defaulted to {growth:.1%} (from {src}, clipped to -5%..25%).")
+        notes.append(f"Stage-1 growth defaulted to {growth:.1%} ({src}; clipped to -5%..25%).")
 
     # WACC via CAPM + after-tax cost of debt
     price, shares = _num(snap.get("currentPrice")), _num(snap.get("sharesOutstanding"))
     mcap = _num(snap.get("marketCap")) or (price * shares if price and shares else None)
     debt = _num(snap.get("totalDebt")) or 0.0
-    cash = _num(snap.get("totalCash")) or 0.0
-    net_debt = debt - cash
+    # Cash: cash + short-term investments, plus long-term investments (marketable securities,
+    # equity stakes) as non-operating assets in the EV-to-equity bridge
+    cash = ttm["cash_and_short_term_investments_latest_quarter"] or _num(snap.get("totalCash")) or 0.0
+    lt_inv = 0.0 if exclude_investments else (ttm["long_term_investments_latest_quarter"] or 0.0)
+    if lt_inv and mcap and lt_inv / mcap > 0.05:
+        notes.append(f"Long-term investments ({lt_inv:,.0f}) are {lt_inv / mcap:.0%} of market cap and are added "
+                     "to equity value; check they are financial assets, or pass --exclude-investments.")
+    net_debt = debt - cash - lt_inv
     b = beta if beta is not None else (_num(snap.get("beta")) or 1.0)
     ke = rf + b * erp
-    # Interest and tax rate: TTM where available, else latest annual
-    interest = ttm["interest_expense"]
+    # Pre-tax cost of debt: override, else TTM interest / debt, else the latest annual
+    # report's interest (only that year, never an older one), else risk-free + spread
+    interest, kd_source = ttm["interest_expense"], "TTM interest expense / total debt"
     if interest is None:
-        ie = sorted(hist["interest_expense"].items(), reverse=True)
-        interest = ie[0][1] if ie else 0.0
-    interest = abs(interest or 0.0)
-    kd_pre = min(max(interest / debt, rf), 0.15) if debt else rf
+        latest_year = f["derived"]["latest_annual_period"]
+        interest = hist["interest_expense"].get(latest_year)
+        kd_source = f"interest expense for fiscal year ending {latest_year} / total debt"
+    if kd is not None:
+        kd_pre, kd_source = kd, "override (--kd)"
+    elif not debt:
+        kd_pre, kd_source = rf, "no debt"
+    elif interest:
+        kd_pre = min(max(abs(interest) / debt, rf), 0.15)
+    else:
+        kd_pre = rf + DEBT_SPREAD
+        kd_source = f"risk-free rate + {DEBT_SPREAD:.0%} spread (interest expense not reported)"
+        notes.append(f"Interest expense is not reported; pre-tax cost of debt assumed at risk-free + "
+                     f"{DEBT_SPREAD:.0%} = {kd_pre:.2%}. Pass --kd to set it.")
     tax = None
     if ttm["tax_provision"] is not None and ttm["pretax_income"]:
         tax = ttm["tax_provision"] / ttm["pretax_income"]
@@ -321,9 +370,9 @@ def dcf(ticker, growth=None, terminal=0.025, wacc=None, years=5, fcf=None,
         if tp and pt.get(tp[0][0]):
             tax = tp[0][1] / pt[tp[0][0]]
     tax = min(max(tax if tax is not None else 0.21, 0.0), 0.35)
-    kd = kd_pre * (1 - tax)
+    kd_after = kd_pre * (1 - tax)
     wd = debt / (debt + mcap) if mcap and debt else 0.0
-    wacc_calc = (1 - wd) * ke + wd * kd
+    wacc_calc = (1 - wd) * ke + wd * kd_after
     used_wacc = wacc if wacc is not None else wacc_calc
 
     base = _dcf_value(fcf, growth, terminal, used_wacc, years, net_debt, shares)
@@ -356,11 +405,12 @@ def dcf(ticker, growth=None, terminal=0.025, wacc=None, years=5, fcf=None,
     return {
         "ticker": ticker.upper(), "currency": snap.get("currency"),
         "assumptions": {
-            "base_fcf": fcf, "base_fcf_source": fcf_source, "stage1_growth": growth, "terminal_growth": terminal,
+            "base_fcf": fcf, "base_fcf_source": fcf_source, "stage1_growth": growth, "growth_inputs": growth_inputs, "terminal_growth": terminal,
             "explicit_years": years, "risk_free_rate": rf, "equity_risk_premium": erp,
-            "beta": b, "cost_of_equity": ke, "pre_tax_cost_of_debt": kd_pre, "tax_rate": tax,
+            "beta": b, "cost_of_equity": ke, "pre_tax_cost_of_debt": kd_pre, "cost_of_debt_source": kd_source, "tax_rate": tax,
             "debt_weight": wd, "wacc_calculated": wacc_calc, "wacc_used": used_wacc,
-            "total_debt": debt, "cash": cash, "net_debt": net_debt, "shares": shares,
+            "total_debt": debt, "cash_and_short_term_investments": cash,
+            "long_term_investments": lt_inv, "net_debt": net_debt, "shares": shares,
         },
         "valuation": base,
         "current_price": price,
@@ -386,6 +436,9 @@ def main():
     p.add_argument("--fcf", type=float, help="base-year free cash flow override")
     p.add_argument("--erp", type=float, default=0.05)
     p.add_argument("--beta", type=float, help="beta override (default: Yahoo beta)")
+    p.add_argument("--kd", type=float, help="pre-tax cost of debt override")
+    p.add_argument("--exclude-investments", action="store_true",
+                   help="do not add long-term investments to equity value")
     a = p.parse_args()
 
     if a.command == "fundamentals":
@@ -393,12 +446,14 @@ def main():
     elif a.command == "risk":
         out = risk(a.ticker, a.years, a.benchmark, a.rf)
     elif a.command == "dcf":
-        out = dcf(a.ticker, a.growth, a.terminal, a.wacc, a.years, a.fcf, a.erp, a.rf, a.beta)
+        out = dcf(a.ticker, a.growth, a.terminal, a.wacc, a.years, a.fcf, a.erp, a.rf, a.beta,
+                  a.kd, a.exclude_investments)
     else:
         r = risk(a.ticker, a.years, a.benchmark, a.rf)
         out = {"risk": r,
                "dcf": dcf(a.ticker, a.growth, a.terminal, a.wacc, a.years, a.fcf, a.erp,
-                          r["risk_free_rate"], a.beta if a.beta is not None else r["beta"])}
+                          r["risk_free_rate"], a.beta if a.beta is not None else r["beta"],
+                          a.kd, a.exclude_investments)}
     json.dump(out, sys.stdout, indent=2, default=str)
     print()
 
