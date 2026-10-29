@@ -62,6 +62,25 @@ def _series(df, *names):
     return {str(k.date() if hasattr(k, "date") else k): _num(v) for k, v in r.dropna().items()}
 
 
+def _quarters(df, *names):
+    """Quarterly values for the first matching row, newest first, as [(date, value)]."""
+    r = _row(df, *names)
+    if r is None:
+        return []
+    return [(k, _num(v)) for k, v in r.dropna().sort_index(ascending=False).items() if _num(v) is not None]
+
+
+def _ttm(df, *names):
+    """Sum of the 4 latest quarters, or None if they are not 4 consecutive quarters."""
+    q = _quarters(df, *names)[:4]
+    if len(q) < 4:
+        return None
+    span = (q[0][0] - q[3][0]).days
+    if not 250 <= span <= 300:  # 3 quarter gaps ~ 273 days; reject holes in the data
+        return None
+    return sum(v for _, v in q)
+
+
 def risk_free_rate(default=0.043):
     """10y Treasury yield from ^TNX, falling back to a default."""
     try:
@@ -118,8 +137,45 @@ def fundamentals(ticker):
     if len(rev) >= 2 and rev[0] > 0:
         cagr = (rev[-1] / rev[0]) ** (1 / (len(rev) - 1)) - 1
 
+    # Quarterly statements: trailing twelve months and recent quarterly trend
+    qinc, qcf, qbs = t.quarterly_financials, t.quarterly_cashflow, t.quarterly_balance_sheet
+    q_cfo = _quarters(qcf, "Operating Cash Flow", "Total Cash From Operating Activities")
+    q_capex = dict(_quarters(qcf, "Capital Expenditure", "Capital Expenditures"))
+    q_rev = _quarters(qinc, "Total Revenue")
+    ttm_cfo = _ttm(qcf, "Operating Cash Flow", "Total Cash From Operating Activities")
+    ttm_capex = _ttm(qcf, "Capital Expenditure", "Capital Expenditures")
+    ttm = {
+        "as_of_quarter": str(q_cfo[0][0].date()) if q_cfo else None,
+        "revenue": _ttm(qinc, "Total Revenue"),
+        "operating_income": _ttm(qinc, "Operating Income", "EBIT"),
+        "net_income": _ttm(qinc, "Net Income", "Net Income Common Stockholders"),
+        "ebitda": _ttm(qinc, "EBITDA", "Normalized EBITDA"),
+        "interest_expense": _ttm(qinc, "Interest Expense"),
+        "tax_provision": _ttm(qinc, "Tax Provision"),
+        "pretax_income": _ttm(qinc, "Pretax Income"),
+        "operating_cash_flow": ttm_cfo,
+        "capex": ttm_capex,
+        "free_cash_flow": ttm_cfo + ttm_capex if ttm_cfo is not None and ttm_capex is not None else None,
+        "cash_latest_quarter": _latest(qbs, "Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments"),
+        "total_debt_latest_quarter": _latest(qbs, "Total Debt"),
+    }
+    quarterly = {
+        "revenue": {str(d.date()): v for d, v in q_rev},
+        "operating_income": {str(d.date()): v for d, v in _quarters(qinc, "Operating Income", "EBIT")},
+        "net_income": {str(d.date()): v for d, v in _quarters(qinc, "Net Income", "Net Income Common Stockholders")},
+        "free_cash_flow": {str(d.date()): v + q_capex[d] for d, v in q_cfo if d in q_capex},
+    }
+
+    # Latest quarter's revenue vs the same quarter a year earlier
+    yoy = None
+    if len(q_rev) >= 5 and q_rev[4][1] and 330 <= (q_rev[0][0] - q_rev[4][0]).days <= 400:
+        yoy = q_rev[0][1] / q_rev[4][1] - 1
+
+    latest_annual = max(history["revenue"]) if history["revenue"] else None
     return {"ticker": ticker.upper(), "snapshot": snapshot, "history": history,
-            "derived": {"revenue_cagr": cagr}}
+            "ttm": ttm, "quarterly": quarterly,
+            "derived": {"revenue_cagr": cagr, "revenue_yoy_latest_quarter": yoy,
+                        "latest_annual_period": latest_annual}}
 
 
 # ---------- risk ----------
@@ -209,23 +265,37 @@ def dcf(ticker, growth=None, terminal=0.025, wacc=None, years=5, fcf=None,
     rf = risk_free_rate() if rf is None else rf
     notes = []
 
-    # Base FCF: latest annual FCF unless overridden; warn if it is far from the 3y average
+    ttm = f["ttm"]
+
+    # Base FCF: trailing twelve months, else latest annual; warn if far from the 3y annual average
     fcf_hist = [v for _, v in sorted(hist["free_cash_flow"].items(), reverse=True) if v is not None]
-    if fcf is None:
-        if not fcf_hist:
-            raise SystemExit("No free cash flow history; pass --fcf")
+    if fcf is not None:
+        fcf_source = "override (--fcf)"
+    elif ttm["free_cash_flow"] is not None:
+        fcf, fcf_source = ttm["free_cash_flow"], f"TTM through {ttm['as_of_quarter']}"
+    elif fcf_hist:
         fcf = fcf_hist[0]
+        fcf_source = f"annual, fiscal year ending {f['derived']['latest_annual_period']}"
+        notes.append("Quarterly cash flow unavailable; base FCF is the latest annual figure and may be stale.")
+    else:
+        raise SystemExit("No free cash flow history; pass --fcf")
+    if fcf_hist and fcf_source != "override (--fcf)":
         avg3 = sum(fcf_hist[:3]) / len(fcf_hist[:3])
         if avg3 and abs(fcf / avg3 - 1) > 0.3:
-            notes.append(f"Latest FCF ({fcf:,.0f}) differs from 3y average ({avg3:,.0f}) by >30%; consider --fcf.")
+            notes.append(f"Base FCF ({fcf:,.0f}) differs from 3y annual average ({avg3:,.0f}) by >30%; consider --fcf.")
     if fcf <= 0:
         notes.append("Base FCF is negative or zero; a DCF on this base is not meaningful without --fcf.")
 
-    # Growth: analyst revenue growth, else historical revenue CAGR, clipped to a sane band
+    # Growth: latest-quarter YoY revenue growth, else Yahoo's figure, else annual CAGR; clipped
     if growth is None:
-        cand = snap.get("revenueGrowth") or f["derived"]["revenue_cagr"] or 0.05
+        d = f["derived"]
+        for src, cand in (("latest-quarter YoY revenue growth", d["revenue_yoy_latest_quarter"]),
+                          ("Yahoo revenue growth", snap.get("revenueGrowth")),
+                          ("annual revenue CAGR", d["revenue_cagr"]), ("fallback", 0.05)):
+            if cand is not None:
+                break
         growth = max(min(cand, 0.25), -0.05)
-        notes.append(f"Stage-1 growth defaulted to {growth:.1%} (from revenue growth, clipped to -5%..25%).")
+        notes.append(f"Stage-1 growth defaulted to {growth:.1%} (from {src}, clipped to -5%..25%).")
 
     # WACC via CAPM + after-tax cost of debt
     price, shares = _num(snap.get("currentPrice")), _num(snap.get("sharesOutstanding"))
@@ -235,13 +305,21 @@ def dcf(ticker, growth=None, terminal=0.025, wacc=None, years=5, fcf=None,
     net_debt = debt - cash
     b = beta if beta is not None else (_num(snap.get("beta")) or 1.0)
     ke = rf + b * erp
-    interest = abs(_latest(yf.Ticker(ticker).financials, "Interest Expense") or 0.0)
+    # Interest and tax rate: TTM where available, else latest annual
+    interest = ttm["interest_expense"]
+    if interest is None:
+        ie = sorted(hist["interest_expense"].items(), reverse=True)
+        interest = ie[0][1] if ie else 0.0
+    interest = abs(interest or 0.0)
     kd_pre = min(max(interest / debt, rf), 0.15) if debt else rf
     tax = None
-    tp = sorted(hist["tax_provision"].items(), reverse=True)
-    pt = dict(hist["pretax_income"])
-    if tp and pt.get(tp[0][0]):
-        tax = tp[0][1] / pt[tp[0][0]]
+    if ttm["tax_provision"] is not None and ttm["pretax_income"]:
+        tax = ttm["tax_provision"] / ttm["pretax_income"]
+    else:
+        tp = sorted(hist["tax_provision"].items(), reverse=True)
+        pt = dict(hist["pretax_income"])
+        if tp and pt.get(tp[0][0]):
+            tax = tp[0][1] / pt[tp[0][0]]
     tax = min(max(tax if tax is not None else 0.21, 0.0), 0.35)
     kd = kd_pre * (1 - tax)
     wd = debt / (debt + mcap) if mcap and debt else 0.0
@@ -278,7 +356,7 @@ def dcf(ticker, growth=None, terminal=0.025, wacc=None, years=5, fcf=None,
     return {
         "ticker": ticker.upper(), "currency": snap.get("currency"),
         "assumptions": {
-            "base_fcf": fcf, "stage1_growth": growth, "terminal_growth": terminal,
+            "base_fcf": fcf, "base_fcf_source": fcf_source, "stage1_growth": growth, "terminal_growth": terminal,
             "explicit_years": years, "risk_free_rate": rf, "equity_risk_premium": erp,
             "beta": b, "cost_of_equity": ke, "pre_tax_cost_of_debt": kd_pre, "tax_rate": tax,
             "debt_weight": wd, "wacc_calculated": wacc_calc, "wacc_used": used_wacc,
