@@ -6,7 +6,7 @@ A [Claude Code](https://code.claude.com) subagent that works like a buy-side equ
 
 - **Fundamentals**: price, market cap, EV, multiples, margins, returns, balance sheet, analyst targets, several years of annual revenue, earnings, cash flow, capex and free cash flow, trailing-twelve-month (TTM) totals, and the last 5-6 quarters.
 - **Risk stats** (vs a benchmark, SPY by default): CAGR, annual and downside volatility, Sharpe, Sortino, beta, Jensen's alpha, correlation, tracking error, information ratio, max and current drawdown with dates, 95% daily VaR/CVaR, and rolling 1-year beta.
-- **DCF**: two-stage free-cash-flow-to-firm model built on TTM free cash flow, tax rate and interest (falling back to the latest annual report when quarterly data is missing). Growth fades from stage 1 to terminal. WACC comes from CAPM (live 10-year Treasury yield) plus after-tax cost of debt. It returns fair value per share, upside vs price, the terminal value's share of EV, and two 5x5 sensitivity grids (WACC × terminal growth, WACC × stage-1 growth).
+- **DCF**: two-stage free-cash-flow-to-firm model built on TTM free cash flow, tax rate and interest (falling back to the latest annual report when quarterly data is missing). Equity value adds cash, short-term and long-term investments. Default growth blends analyst consensus with historical revenue growth. Growth fades from stage 1 to terminal. WACC comes from CAPM (live 10-year Treasury yield) plus after-tax cost of debt. It returns fair value per share, upside vs price, the terminal value's share of EV, and two 5x5 sensitivity grids (WACC × terminal growth, WACC × stage-1 growth).
 - **Judgment**: the agent checks the default inputs before trusting them. It normalizes distorted cash flow years, overrides growth or beta when needed, runs bear and bull cases, and flags results that depend mostly on assumptions.
 - **Context**: it searches the web for recent earnings, guidance and news, and cites each source.
 
@@ -54,12 +54,14 @@ The calculations also work without Claude. Every command prints JSON.
 | `--years` | Risk lookback / DCF explicit years | 5 |
 | `--benchmark` | Benchmark ticker for risk stats | SPY |
 | `--rf` | Risk-free rate | live 10-year yield |
-| `--growth` | Stage-1 FCF growth | latest quarter's YoY revenue growth, clipped to -5%..25% |
+| `--growth` | Stage-1 FCF growth | average of consensus revenue growth (this FY, next FY) and historical revenue CAGR, clipped to -5%..25% |
 | `--terminal` | Terminal growth | 2.5% |
 | `--wacc` | WACC override | calculated |
 | `--fcf` | Base-year FCF override | TTM FCF |
 | `--erp` | Equity risk premium | 5% |
 | `--beta` | Beta override | Yahoo beta (`all` uses the computed beta) |
+| `--kd` | Pre-tax cost of debt | TTM interest / debt, or risk-free + 1% if interest isn't reported |
+| `--exclude-investments` | Leave long-term investments out of equity value | included |
 
 ## Notes
 

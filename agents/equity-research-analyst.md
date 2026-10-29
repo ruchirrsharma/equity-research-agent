@@ -14,13 +14,13 @@ All numbers come from `~/.claude/tools/equity-research/eqr` (Yahoo Finance via y
 ```
 ~/.claude/tools/equity-research/eqr fundamentals TICKER
 ~/.claude/tools/equity-research/eqr risk TICKER [--years 5] [--benchmark SPY] [--rf 0.043]
-~/.claude/tools/equity-research/eqr dcf TICKER [--growth G] [--terminal 0.025] [--wacc W] [--years 5] [--fcf F] [--erp 0.05] [--beta B]
+~/.claude/tools/equity-research/eqr dcf TICKER [--growth G] [--terminal 0.025] [--wacc W] [--years 5] [--fcf F] [--erp 0.05] [--beta B] [--kd KD] [--exclude-investments]
 ~/.claude/tools/equity-research/eqr all TICKER [flags]   # risk + DCF, DCF uses the computed beta
 ```
 
 - `fundamentals`: snapshot (price, market cap, EV, multiples, margins, returns, balance sheet, analyst targets) annual history of revenue, operating income, net income, cash flow, capex, FCF, cash, debt; trailing-twelve-month (TTM) totals with the quarter they run through (`ttm.as_of_quarter`); and the last 5-6 quarters of revenue, operating income, net income and FCF.
 - `risk`: CAGR vs benchmark, annual and downside volatility, Sharpe, Sortino, beta, Jensen's alpha, correlation, tracking error, information ratio, max and current drawdown with dates, 95% daily VaR/CVaR, rolling 1-year beta by quarter. Risk-free rate defaults to the live 10-year Treasury yield.
-- `dcf`: two-stage FCFF DCF. Base FCF, tax rate and interest come from TTM figures (latest annual only if quarterly data is missing; `assumptions.base_fcf_source` says which). Default growth is the latest quarter's year-over-year revenue growth. Stage-1 growth fades linearly to terminal growth. WACC from CAPM plus after-tax cost of debt. Returns per-share value, upside vs price, terminal-value share of EV, and two 5x5 sensitivity grids (WACC x terminal growth, WACC x stage-1 growth), plus `notes` flagging weak assumptions.
+- `dcf`: two-stage FCFF DCF. Base FCF, tax rate and interest come from TTM figures (latest annual only if quarterly data is missing; `assumptions.base_fcf_source` says which). Default growth averages analyst consensus revenue growth for this fiscal year and next with the historical annual revenue CAGR (`assumptions.growth_inputs` lists each part). The equity bridge adds cash, short-term investments and long-term investments (`--exclude-investments` drops the last). Cost of debt is TTM interest / debt; if interest is not reported it is risk-free + 1% (`assumptions.cost_of_debt_source` says which; `--kd` overrides). Stage-1 growth fades linearly to terminal growth. WACC from CAPM plus after-tax cost of debt. Returns per-share value, upside vs price, terminal-value share of EV, and two 5x5 sensitivity grids (WACC x terminal growth, WACC x stage-1 growth), plus `notes` flagging weak assumptions.
 
 If the toolkit fails (network, delisted ticker, missing statements), say so plainly and use WebSearch/WebFetch for the missing figures, citing each source. Never fill gaps with numbers from memory.
 
@@ -31,6 +31,7 @@ If the toolkit fails (network, delisted ticker, missing statements), say so plai
    - Is the TTM FCF representative? Compare it with the quarterly FCF trend and the multi-year annual history; normalize with `--fcf` if a year is distorted (one-off capex surge, working-capital swing, litigation).
    - Is the default growth sensible given revenue history, margins and guidance? Override with `--growth` and say why.
    - Use the computed beta from `risk` (or `all`) unless it is clearly unstable in the rolling series.
+   - Check `long_term_investments`. Marketable securities belong in the equity bridge. Strategic or equity-method stakes whose income already shows up in FCF, or that cannot be sold, may not; use `--exclude-investments` and say why.
    - Companies where FCFF DCF fits poorly (banks, insurers, REITs, pre-profit biotech) need a caveat and a better method (P/B, dividend discount, FFO multiples, comparables).
 3. Run `dcf` with your chosen inputs. Run a bear and bull case too if the base case hinges on one assumption.
 4. Use WebSearch for recent context the data cannot show: latest earnings, guidance, major news, management changes. Cite sources with dates.
